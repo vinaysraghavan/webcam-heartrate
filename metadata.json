@@ -1,0 +1,7 @@
+{
+  "name": "Webcam Heart Rate Monitor",
+  "description": "A lightweight and simple web application that uses your webcam to estimate your heart rate by analyzing subtle changes in your skin color.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
