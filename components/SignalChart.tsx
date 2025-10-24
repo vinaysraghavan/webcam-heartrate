@@ -3,15 +3,16 @@ import { LineChart, Line, ResponsiveContainer, YAxis, CartesianGrid } from 'rech
 
 interface SignalChartProps {
     data: { time: number, value: number }[];
+    yDomain: [number, number] | ['auto', 'auto'];
 }
 
-export const SignalChart: React.FC<SignalChartProps> = ({ data }) => {
+export const SignalChart: React.FC<SignalChartProps> = ({ data, yDomain }) => {
     return (
         <div className="w-full h-32 bg-gray-900/70 p-2 rounded-lg border border-gray-700">
             {data.length > 0 ? (
                 <ResponsiveContainer width="100%" height="100%">
                     <LineChart data={data}>
-                        <YAxis domain={['auto', 'auto']} hide={true} />
+                        <YAxis domain={yDomain} hide={true} />
                         <CartesianGrid stroke="rgba(75, 85, 99, 0.4)" strokeDasharray="3 3" />
                         <Line
                             type="monotone"

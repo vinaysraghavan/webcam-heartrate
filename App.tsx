@@ -11,6 +11,9 @@ const WINDOW_SECONDS = 20; // Increased window for longer history
 const BUFFER_SIZE = FPS * WINDOW_SECONDS;
 const MIN_BPM = 45;
 const MAX_BPM = 200;
+const LOW_PASS_ALPHA = 0.5; // Smoothing factor for the low-pass filter
+const MOTION_THRESHOLD = 4.0; // Max allowed change between frames to filter out movement artifacts
+const COVERAGE_STD_DEV_THRESHOLD = 16.0; // Max standard deviation of pixel color to be considered "covered". Increased from 12.0 to make detection less strict.
 
 // --- Signal Processing Helpers ---
 
@@ -29,6 +32,20 @@ const detrendSignal = (signal: number[]): number[] => {
   });
   return signal.map((val, i) => val - movingAverage[i]);
 };
+
+/**
+ * Applies a simple IIR low-pass filter to a signal.
+ * This helps to smooth out high-frequency noise.
+ */
+const lowPassFilter = (signal: number[], alpha: number): number[] => {
+    if (signal.length === 0) return [];
+    const filteredSignal: number[] = [signal[0]];
+    for (let i = 1; i < signal.length; i++) {
+        filteredSignal[i] = alpha * signal[i] + (1 - alpha) * filteredSignal[i - 1];
+    }
+    return filteredSignal;
+};
+
 
 /**
  * Calculates the magnitude spectrum of a signal using a Discrete Fourier Transform (DFT).
@@ -63,12 +80,15 @@ const App: React.FC = () => {
     const [chartData, setChartData] = useState<{ time: number, value: number }[]>([]);
     const [status, setStatus] = useState<string>('Ready');
     const [error, setError] = useState<string | null>(null);
+    const [yDomain, setYDomain] = useState<[number, number] | ['auto', 'auto']>(['auto', 'auto']);
+
 
     const videoRef = useRef<HTMLVideoElement>(null);
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const animationFrameId = useRef<number | null>(null);
     const dataBuffer = useRef<number[]>([]);
     const streamRef = useRef<MediaStream | null>(null);
+    const lastRedAverage = useRef<number | null>(null);
     
     const processFrame = useCallback(() => {
         if (!videoRef.current || !canvasRef.current || videoRef.current.paused || videoRef.current.ended) {
@@ -82,12 +102,50 @@ const App: React.FC = () => {
         
         const imageData = ctx.getImageData(0, 0, VIDEO_WIDTH, VIDEO_HEIGHT);
         const data = imageData.data;
+        const numPixels = data.length / 4;
         
         let redSum = 0;
         for (let i = 0; i < data.length; i += 4) {
             redSum += data[i];
         }
-        const redAverage = redSum / (data.length / 4);
+        const redAverage = redSum / numPixels;
+
+        // --- Finger Coverage Detection ---
+        let redSumOfSquares = 0;
+        for (let i = 0; i < data.length; i += 4) {
+            redSumOfSquares += (data[i] - redAverage) * (data[i] - redAverage);
+        }
+        const redVariance = redSumOfSquares / numPixels;
+        const redStdDev = Math.sqrt(redVariance);
+
+        if (redStdDev > COVERAGE_STD_DEV_THRESHOLD) {
+            setStatus('Please cover the camera lens.');
+            // If we were monitoring, reset everything
+            if (dataBuffer.current.length > 0) {
+                dataBuffer.current = [];
+                setHeartRate(0);
+                setChartData([]);
+                setYDomain(['auto', 'auto']);
+            }
+            animationFrameId.current = requestAnimationFrame(processFrame);
+            return;
+        }
+        
+        // --- Motion Artifact Detection ---
+        if (lastRedAverage.current !== null) {
+            const diff = Math.abs(redAverage - lastRedAverage.current);
+            if (diff > MOTION_THRESHOLD) {
+                setStatus('Motion detected. Please hold still.');
+                dataBuffer.current = []; // Reset buffer
+                setHeartRate(0);
+                setChartData([]);
+                setYDomain(['auto', 'auto']);
+                lastRedAverage.current = redAverage; // Update for next frame comparison
+                animationFrameId.current = requestAnimationFrame(processFrame);
+                return; // Skip processing this frame
+            }
+        }
+        lastRedAverage.current = redAverage;
 
         dataBuffer.current.push(redAverage);
         
@@ -100,12 +158,13 @@ const App: React.FC = () => {
         } else {
             setStatus('Processing...');
             const detrended = detrendSignal(dataBuffer.current);
+            const filtered = lowPassFilter(detrended, LOW_PASS_ALPHA);
             
             // --- FFT-based heart rate calculation ---
-            const magnitudes = calculateMagnitudes(detrended);
+            const magnitudes = calculateMagnitudes(filtered);
             
-            const samples = detrended.length;
-            const sampleRate = FPS; // Approximation of sample rate
+            const samples = filtered.length;
+            const sampleRate = FPS;
             
             const minFreq = MIN_BPM / 60;
             const maxFreq = MAX_BPM / 60;
@@ -126,14 +185,27 @@ const App: React.FC = () => {
             if (peakIndex !== -1) {
                 const peakFrequency = (peakIndex * sampleRate) / samples;
                 const bpm = peakFrequency * 60;
-                
-                // Use a smoothing factor to prevent jerky updates
                 setHeartRate(prev => (prev * 0.9) + (bpm * 0.1));
             }
 
-            // Update chart data with the detrended signal for better visualization
-            const newChartData = detrended.map((value, index) => ({ time: index, value }));
+            // Update chart data and Y-domain
+            const newChartData = filtered.map((value, index) => ({ time: index, value }));
             setChartData(newChartData);
+
+            const signalMin = Math.min(...filtered);
+            const signalMax = Math.max(...filtered);
+            const signalPadding = (signalMax - signalMin) * 0.1 || 1; // Add padding or a default if flat
+
+            setYDomain(prevDomain => {
+                // FIX: Use a `typeof` check as a more robust type guard for the tuple union state.
+                // This helps TypeScript correctly infer the type of `prevDomain` in each branch.
+                if (typeof prevDomain[0] === 'string') {
+                    return [signalMin - signalPadding, signalMax + signalPadding];
+                }
+                const newMin = prevDomain[0] * 0.98 + (signalMin - signalPadding) * 0.02;
+                const newMax = prevDomain[1] * 0.98 + (signalMax + signalPadding) * 0.02;
+                return [newMin, newMax];
+            });
         }
 
         animationFrameId.current = requestAnimationFrame(processFrame);
@@ -143,6 +215,7 @@ const App: React.FC = () => {
         if (isMonitoring) return;
         setError(null);
         setStatus('Initializing camera...');
+        lastRedAverage.current = null; // Reset on start
         try {
             const stream = await navigator.mediaDevices.getUserMedia({
                 video: { width: VIDEO_WIDTH, height: VIDEO_HEIGHT, frameRate: { ideal: FPS, max: FPS } }
@@ -181,6 +254,8 @@ const App: React.FC = () => {
         setChartData([]);
         setStatus('Ready');
         dataBuffer.current = [];
+        lastRedAverage.current = null;
+        setYDomain(['auto', 'auto']);
     }, [isMonitoring]);
 
     useEffect(() => {
@@ -210,13 +285,20 @@ const App: React.FC = () => {
                 <div className="grid md:grid-cols-2 gap-6">
                     <div className="relative w-full aspect-[4/3] bg-gray-900 rounded-lg overflow-hidden border-2 border-gray-700 flex items-center justify-center">
                         <video ref={videoRef} className="w-full h-full object-cover" muted playsInline />
-                        {!isMonitoring && (
-                            <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/60 p-4 text-center">
-                                <Icons.CameraOff className="w-16 h-16 text-gray-500 mb-4"/>
-                                <p className="text-gray-300 font-semibold">Camera is off</p>
-                                <p className="text-gray-400 text-sm mt-1">For best results, cover the camera lens completely with your finger.</p>
-                            </div>
-                        )}
+                        <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/60 p-4 text-center pointer-events-none">
+                             {isMonitoring ? (
+                                <p className="text-white font-semibold opacity-80 bg-black/30 px-3 py-1 rounded-md">
+                                    {status.includes('Calibrating') || status.includes('Processing') 
+                                      ? "Keep your finger steady..." 
+                                      : "Place your finger over the lens"}
+                                </p>
+                            ) : (
+                                <>
+                                    <Icons.CameraOff className="w-16 h-16 text-gray-500 mb-4"/>
+                                    <p className="text-gray-300 font-semibold">Camera is off</p>
+                                </>
+                            )}
+                        </div>
                     </div>
                     <div className="flex flex-col justify-between">
                         <HeartRateDisplay bpm={heartRate} status={status} />
@@ -238,7 +320,7 @@ const App: React.FC = () => {
 
                 <div className="mt-6">
                     <h2 className="text-lg font-semibold text-gray-300 mb-2">Estimated EKG Signal</h2>
-                    <SignalChart data={chartData} />
+                    <SignalChart data={chartData} yDomain={yDomain} />
                 </div>
             </div>
             <canvas ref={canvasRef} width={VIDEO_WIDTH} height={VIDEO_HEIGHT} className="hidden"></canvas>
